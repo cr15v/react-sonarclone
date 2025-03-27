@@ -35,11 +35,6 @@ import {runWithFiberInDEV} from 'react-reconciler/src/ReactCurrentFiber';
 import hasOwnProperty from 'shared/hasOwnProperty';
 import {checkAttributeStringCoercion} from 'shared/CheckStringCoercion';
 import {REACT_CONTEXT_TYPE} from 'shared/ReactSymbols';
-import {
-  isFiberContainedBy,
-  isFiberFollowing,
-  isFiberPreceding,
-} from 'react-reconciler/src/ReactFiberTreeReflection';
 
 export {
   setCurrentUpdatePriority,
@@ -66,6 +61,11 @@ import {
   getFragmentParentHostFiber,
   getNextSiblingHostFiber,
   getInstanceFromHostFiber,
+  groupFragmentChildrenByScrollContainer,
+  isFiberContainedBy,
+  isFiberFollowing,
+  isFiberPreceding,
+  getFragmentInstanceSiblings,
 } from 'react-reconciler/src/ReactFiberTreeReflection';
 
 export {detachDeletedInstance};
@@ -2427,6 +2427,7 @@ export type FragmentInstanceType = {
     composed: boolean,
   }): Document | ShadowRoot | FragmentInstanceType,
   compareDocumentPosition(otherNode: Instance): number,
+  scrollIntoView(alignToTop?: boolean): void,
 };
 
 function FragmentInstance(this: FragmentInstanceType, fragmentFiber: Fiber) {
@@ -2654,10 +2655,10 @@ FragmentInstance.prototype.getClientRects = function (
   this: FragmentInstanceType,
 ): Array<DOMRect> {
   const rects: Array<DOMRect> = [];
-  traverseFragmentInstance(this._fragmentFiber, collectClientRects, rects);
+  traverseFragmentInstance(this._fragmentFiber, collectClientRectsFlat, rects);
   return rects;
 };
-function collectClientRects(child: Fiber, rects: Array<DOMRect>): boolean {
+function collectClientRectsFlat(child: Fiber, rects: Array<DOMRect>): boolean {
   const instance = getInstanceFromHostFiber(child);
   // $FlowFixMe[method-unbinding]
   rects.push.apply(rects, instance.getClientRects());
@@ -2801,6 +2802,113 @@ function validateDocumentPositionWithFiberTree(
   }
 
   return false;
+}
+// $FlowFixMe[prop-missing]
+FragmentInstance.prototype.scrollIntoView = function (
+  this: FragmentInstanceType,
+  alignToTop?: boolean,
+): void {
+  if (typeof alignToTop === 'object') {
+    throw new Error(
+      'FragmentInstance.scrollIntoView() does not support ' +
+        'scrollIntoViewOptions. Use the alignToTop boolean instead.',
+    );
+  }
+
+  const childrenByScrollContainer = groupFragmentChildrenByScrollContainer(
+    this._fragmentFiber,
+    fiber => {
+      const instance = getInstanceFromHostFiber(fiber);
+      const position = getComputedStyle(instance).position;
+      return position === 'sticky' || position === 'fixed';
+    },
+  );
+
+  // If there are no children, go off the previous or next sibling
+  if (childrenByScrollContainer[0].length === 0) {
+    const hostSiblings = getFragmentInstanceSiblings(this._fragmentFiber);
+    const targetFiber =
+      (alignToTop === false
+        ? hostSiblings[0] || hostSiblings[1]
+        : hostSiblings[1] || hostSiblings[0]) ||
+      getFragmentParentHostFiber(this._fragmentFiber);
+    if (targetFiber === null) {
+      if (__DEV__) {
+        console.error(
+          'You are attempting to scroll a FragmentInstance that has no ' +
+            'children, siblings, or parent. No scroll was performed.',
+        );
+      }
+      return;
+    }
+    const target = getInstanceFromHostFiber(targetFiber);
+    target.scrollIntoView(alignToTop);
+  } else {
+    iterateFragmentChildrenScrollContainers(
+      childrenByScrollContainer,
+      alignToTop !== false,
+      (targetFiber, alignToTopArg, scrollState) => {
+        if (targetFiber) {
+          const target = getInstanceFromHostFiber(targetFiber);
+          const targetPosition = getComputedStyle(target).position;
+          const isStickyOrFixed =
+            targetPosition === 'sticky' || targetPosition === 'fixed';
+          const targetRect = target.getBoundingClientRect();
+          const distanceToTargetEdge = Math.abs(targetRect.bottom);
+          const hasNotScrolled =
+            scrollState.nextScrollThreshold === Number.MAX_SAFE_INTEGER;
+          const ownerDocument = target.ownerDocument;
+          const documentElement = ownerDocument.documentElement;
+          const targetWithinViewport =
+            documentElement &&
+            (targetRect.top >= 0 ||
+              targetRect.bottom <= documentElement.clientHeight);
+          // If we've already scrolled, only scroll again if
+          // 1) The previous scroll target was sticky or fixed OR
+          // 2) Scrolling to the next target won't remove previous target from viewport AND
+          // 3) The next target is not already in the viewport
+          if (
+            hasNotScrolled ||
+            scrollState.prevWasStickyOrFixed ||
+            (distanceToTargetEdge < scrollState.nextScrollThreshold &&
+              !targetWithinViewport)
+          ) {
+            target.scrollIntoView(alignToTopArg);
+            scrollState.nextScrollThreshold = targetRect.height;
+            scrollState.prevWasStickyOrFixed = isStickyOrFixed;
+          }
+        }
+      },
+    );
+  }
+};
+
+function iterateFragmentChildrenScrollContainers(
+  childrenByScrollContainer: Array<Array<Fiber>>,
+  alignToTop: boolean,
+  callback: (
+    child: Fiber | null,
+    arg: boolean,
+    scrollState: {nextScrollThreshold: number, prevWasStickyOrFixed: boolean},
+  ) => void,
+) {
+  const scrollState = {
+    nextScrollThreshold: Number.MAX_SAFE_INTEGER,
+    prevWasStickyOrFixed: false,
+  };
+  if (alignToTop) {
+    for (let i = 0; i < childrenByScrollContainer.length; i++) {
+      const children = childrenByScrollContainer[i];
+      const child = children[0];
+      callback(child, alignToTop, scrollState);
+    }
+  } else {
+    for (let i = childrenByScrollContainer.length - 1; i >= 0; i--) {
+      const children = childrenByScrollContainer[i];
+      const child = children[children.length - 1];
+      callback(child, alignToTop, scrollState);
+    }
+  }
 }
 
 function normalizeListenerOptions(
