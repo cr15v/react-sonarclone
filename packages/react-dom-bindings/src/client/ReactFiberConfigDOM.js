@@ -61,7 +61,6 @@ import {
   getFragmentParentHostFiber,
   getNextSiblingHostFiber,
   getInstanceFromHostFiber,
-  groupFragmentChildrenByScrollContainer,
   isFiberContainedBy,
   isFiberFollowing,
   isFiberPreceding,
@@ -2803,6 +2802,7 @@ function validateDocumentPositionWithFiberTree(
 
   return false;
 }
+
 // $FlowFixMe[prop-missing]
 FragmentInstance.prototype.scrollIntoView = function (
   this: FragmentInstanceType,
@@ -2814,18 +2814,12 @@ FragmentInstance.prototype.scrollIntoView = function (
         'scrollIntoViewOptions. Use the alignToTop boolean instead.',
     );
   }
+  // First, get the children nodes
+  const children: Array<Fiber> = [];
+  traverseFragmentInstance(this._fragmentFiber, collectChildren, children);
 
-  const childrenByScrollContainer = groupFragmentChildrenByScrollContainer(
-    this._fragmentFiber,
-    fiber => {
-      const instance = getInstanceFromHostFiber(fiber);
-      const position = getComputedStyle(instance).position;
-      return position === 'sticky' || position === 'fixed';
-    },
-  );
-
-  // If there are no children, go off the previous or next sibling
-  if (childrenByScrollContainer[0].length === 0) {
+  // If there are no children, we can use the parent and siblings to determine a position.
+  if (children.length === 0) {
     const hostSiblings = getFragmentInstanceSiblings(this._fragmentFiber);
     const targetFiber =
       (alignToTop === false
@@ -2843,70 +2837,132 @@ FragmentInstance.prototype.scrollIntoView = function (
     }
     const target = getInstanceFromHostFiber(targetFiber);
     target.scrollIntoView(alignToTop);
-  } else {
-    iterateFragmentChildrenScrollContainers(
-      childrenByScrollContainer,
-      alignToTop !== false,
-      (targetFiber, alignToTopArg, scrollState) => {
-        if (targetFiber) {
-          const target = getInstanceFromHostFiber(targetFiber);
-          const targetPosition = getComputedStyle(target).position;
-          const isStickyOrFixed =
-            targetPosition === 'sticky' || targetPosition === 'fixed';
-          const targetRect = target.getBoundingClientRect();
-          const distanceToTargetEdge = Math.abs(targetRect.bottom);
-          const hasNotScrolled =
-            scrollState.nextScrollThreshold === Number.MAX_SAFE_INTEGER;
-          const ownerDocument = target.ownerDocument;
-          const documentElement = ownerDocument.documentElement;
-          const targetWithinViewport =
-            documentElement &&
-            (targetRect.top >= 0 ||
-              targetRect.bottom <= documentElement.clientHeight);
-          // If we've already scrolled, only scroll again if
-          // 1) The previous scroll target was sticky or fixed OR
-          // 2) Scrolling to the next target won't remove previous target from viewport AND
-          // 3) The next target is not already in the viewport
-          if (
-            hasNotScrolled ||
-            scrollState.prevWasStickyOrFixed ||
-            (distanceToTargetEdge < scrollState.nextScrollThreshold &&
-              !targetWithinViewport)
-          ) {
-            target.scrollIntoView(alignToTopArg);
-            scrollState.nextScrollThreshold = targetRect.height;
-            scrollState.prevWasStickyOrFixed = isStickyOrFixed;
-          }
-        }
-      },
-    );
+    return;
   }
+
+  // If there are children, group them by scroll container
+  const childrenByScrollContainer = groupFibersByDOMScrollContainer(children);
+  // Scroll to the first or last child in each scroll container, depending on alignToTop
+  scrollToEachFragmentScrollContainer(
+    childrenByScrollContainer,
+    alignToTop !== false,
+  );
 };
 
-function iterateFragmentChildrenScrollContainers(
-  childrenByScrollContainer: Array<Array<Fiber>>,
-  alignToTop: boolean,
-  callback: (
-    child: Fiber | null,
-    arg: boolean,
-    scrollState: {nextScrollThreshold: number, prevWasStickyOrFixed: boolean},
-  ) => void,
-) {
-  const scrollState = {
-    nextScrollThreshold: Number.MAX_SAFE_INTEGER,
-    prevWasStickyOrFixed: false,
-  };
-  if (alignToTop) {
-    for (let i = 0; i < childrenByScrollContainer.length; i++) {
-      const children = childrenByScrollContainer[i];
-      const child = children[0];
-      callback(child, alignToTop, scrollState);
+function isInstanceScrollable(inst: Instance) {
+  const style = getComputedStyle(inst);
+  // Check if node is fixed position
+  if (style.position === 'fixed') {
+    return true;
+  }
+  // Check if overflow is set to auto or scroll
+  if (style.overflow === 'auto' || style.overflow === 'scroll') {
+    // $FlowFixMe[prop-missing]
+    const width = inst.offsetWidth;
+    // $FlowFixMe[prop-missing]
+    const height = inst.offsetHeight;
+    const scrollWidth = inst.scrollWidth;
+    const scrollHeight = inst.scrollHeight;
+
+    return width < scrollWidth || height < scrollHeight;
+  }
+  return false;
+}
+
+function searchDOMUntilCommonAncestor(
+  instA: Instance,
+  instB: Instance,
+  testFn: (instA: Instance) => boolean,
+): boolean {
+  // Walk up from instA and count depth
+  let currentNode: ?Instance = instA;
+  let depthA = 0;
+  while (currentNode) {
+    if (testFn(currentNode)) {
+      return true;
     }
-  } else {
+    depthA++;
+    currentNode = currentNode.parentElement;
+  }
+
+  // Walk up from instB and count depth
+  currentNode = instB;
+  let depthB = 0;
+  while (currentNode) {
+    if (testFn(currentNode)) {
+      return true;
+    }
+    depthB++;
+    currentNode = currentNode.parentElement;
+  }
+
+  // Reset currentNode to instA and instB
+  let nodeA: ?Instance = instA;
+  let nodeB: ?Instance = instB;
+
+  // Align depths
+  while (depthA > depthB && nodeA) {
+    nodeA = nodeA.parentElement;
+    depthA--;
+  }
+  while (depthB > depthA && nodeB) {
+    nodeB = nodeB.parentElement;
+    depthB--;
+  }
+
+  // Walk up both nodes to find common ancestor
+  while (nodeA && nodeB) {
+    if (nodeA === nodeB) {
+      return testFn(nodeA);
+    }
+    nodeA = nodeA.parentElement;
+    nodeB = nodeB.parentElement;
+  }
+
+  return false;
+}
+
+function groupFibersByDOMScrollContainer(
+  children: Array<Fiber>,
+): Array<Array<Instance>> {
+  const scrollContainers: Array<Array<Instance>> = [[]];
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    const instance = getInstanceFromHostFiber(child);
+    const lastScrollContainer = scrollContainers[scrollContainers.length - 1];
+    const prevInstance = lastScrollContainer[lastScrollContainer.length - 1];
+    if (
+      scrollContainers[scrollContainers.length - 1].length === 0 ||
+      (prevInstance &&
+        !searchDOMUntilCommonAncestor(
+          instance,
+          prevInstance,
+          isInstanceScrollable,
+        ))
+    ) {
+      scrollContainers[scrollContainers.length - 1].push(instance);
+    } else {
+      scrollContainers.push([instance]);
+    }
+  }
+  return scrollContainers;
+}
+
+function scrollToEachFragmentScrollContainer(
+  childrenByScrollContainer: Array<Array<Instance>>,
+  alignToTop: boolean,
+) {
+  if (alignToTop) {
     for (let i = childrenByScrollContainer.length - 1; i >= 0; i--) {
       const children = childrenByScrollContainer[i];
+      const child = children[0];
+      child.scrollIntoView(alignToTop);
+    }
+  } else {
+    for (let i = 0; i < childrenByScrollContainer.length; i++) {
+      const children = childrenByScrollContainer[i];
       const child = children[children.length - 1];
-      callback(child, alignToTop, scrollState);
+      child.scrollIntoView(alignToTop);
     }
   }
 }

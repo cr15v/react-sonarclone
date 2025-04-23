@@ -373,68 +373,6 @@ function traverseVisibleHostChildren<A, B, C>(
   return false;
 }
 
-export function groupFragmentChildrenByScrollContainer(
-  fragmentFiber: Fiber,
-  detectNewHostScrollContainer: (fiber: Fiber) => boolean,
-): Array<Array<Fiber>> {
-  const groups: Array<Array<Fiber>> = [[]];
-  groupFragmentChildrenByScrollContainer_recursive(
-    fragmentFiber.child,
-    groups,
-    detectNewHostScrollContainer,
-  );
-  return groups;
-}
-
-function groupFragmentChildrenByScrollContainer_recursive(
-  child: Fiber | null,
-  groups: Array<Array<Fiber>>,
-  detectNewHostScrollContainer: (fiber: Fiber) => boolean,
-): void {
-  let withinPortal: boolean = false;
-  while (child !== null) {
-    if (child.tag === HostComponent) {
-      const needsNewScrollContainer = detectNewHostScrollContainer(child);
-      if (needsNewScrollContainer) {
-        if (groups[groups.length - 1].length !== 0) {
-          groups.push([child]);
-        } else {
-          groups[groups.length - 1].push(child);
-        }
-        groups.push([]);
-      } else {
-        groups[groups.length - 1].push(child);
-      }
-    } else if (
-      child.tag === OffscreenComponent &&
-      child.memoizedState !== null
-    ) {
-      // Skip hidden subtrees
-    } else {
-      // Add children of a portal into their own group
-      if (child.tag === HostPortal) {
-        withinPortal = true;
-        if (groups[groups.length - 1].length !== 0) {
-          groups.push([]);
-        }
-      }
-      groupFragmentChildrenByScrollContainer_recursive(
-        child.child,
-        groups,
-        detectNewHostScrollContainer,
-      );
-      // Exiting portal, add a new group for the next sibling
-      if (withinPortal) {
-        withinPortal = false;
-        if (groups[groups.length - 1].length !== 0) {
-          groups.push([]);
-        }
-      }
-    }
-    child = child.sibling;
-  }
-}
-
 export function getFragmentParentHostFiber(fiber: Fiber): null | Fiber {
   let parent = fiber.return;
   while (parent !== null) {
