@@ -22,9 +22,6 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
       - name: Run SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@v2
         with:
