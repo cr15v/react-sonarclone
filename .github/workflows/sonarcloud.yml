@@ -22,6 +22,8 @@ jobs:
         with:
           node-version: '18'
 
+      # Eliminamos npm install para evitar errores innecesarios
+
       - name: Run SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@v2
         with:
